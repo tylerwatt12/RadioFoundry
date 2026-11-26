@@ -17,7 +17,7 @@ on:
           - 11922518e8b03f1e18b32c5a336fb4d1baeff27f
           - 2008e4ca2f61fc58446f338c24bc2d1e71c8a899
           - e588d0e76b34f9ec444382ad56bdcc1c728a632c
-          - e093c2b7a5278039952aa65e4e0bde5a39809eb2
+          - 8769c7112ee84094057dd382b74b1764009be698
       boards:
         description: all, or comma-separated board IDs from the selected source registry
         type: string
