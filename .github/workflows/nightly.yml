@@ -1,169 +1,247 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 The RadioFoundry Authors
 #
-# Nightly CI (docs/dev/ci.md): the long builds the per-push workflow leaves out, on the default branch.
-#   matrix       one job per toolchain (Arm, C-SKY), every board built with it from the registry: a build per feature
-#                switch turned off alone, fm-minimal and maximal, each with zero warnings and its size (tools/ci.sh
-#                --matrix --toolchain; about 4-5 minutes per board on the runner). C-SKY in the csky-elf image unless
-#                the runner has csky-elf GCC (skipped where the image isn't available)
-#   reuse        `reuse lint`, reported as a warning until the tree passes it
-# A scheduled run builds only what changed since the last commit that passed: a successful run saves a cache entry
-# named after its commit (nightly-ok-<sha>, holding the sha), and the next scheduled run restores the newest one and
-# diffs against it. The matrix runs when a file the firmware builds read changed (ci.yml's paths), reuse lint when
-# any file did. A night with no firmware change records its commit as passed without building. That works the same
-# on Gitea and GitHub (no API token, no clock arithmetic), catches up after nights the runner was off, and an evicted
-# entry only costs one repeated run. A manual run (workflow_dispatch) always builds.
+# Manual validation only, on an isolated CI branch that never merges into the product branches. The workflow is
+# loaded from this branch, but every job checks out and proves the selected product commit. One complete official
+# firmware gate per board avoids the toolchain-wide timeout without changing any build or resource policy.
 name: Nightly
 
 on:
-  schedule:
-    - cron: "17 7 * * *"   # 07:17 UTC, early morning in the US
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact published product commit to validate
+        type: choice
+        required: true
+        options:
+          - 11922518e8b03f1e18b32c5a336fb4d1baeff27f
+          - 2008e4ca2f61fc58446f338c24bc2d1e71c8a899
+          - e588d0e76b34f9ec444382ad56bdcc1c728a632c
+          - e093c2b7a5278039952aa65e4e0bde5a39809eb2
+      boards:
+        description: all, or comma-separated board IDs from the selected source registry
+        type: string
+        required: false
+        default: all
 
 permissions:
   contents: read
+  packages: read
 
 concurrency:
-  group: nightly-${{ github.ref }}
+  group: p25-validation-${{ inputs.source_sha }}
   cancel-in-progress: false
 
-jobs:
-  changes:
-    if: (github.server_url != 'https://github.com' || vars.RFOUNDRY_CI_GITHUB == 'true')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      run: ${{ steps.decide.outputs.run }}
-      reuse: ${{ steps.decide.outputs.reuse }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
-        with:
-          fetch-depth: 0   # the last passed commit must be here to diff against
-          submodules: false
-      # the newest nightly-ok-* entry: this commit's (an exact hit) or the last commit that passed (a prefix match)
-      - name: Look up the last nightly pass
-        id: tested
-        if: github.event_name == 'schedule'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
-        with:
-          path: .nightly-ok
-          key: nightly-ok-${{ github.sha }}
-          restore-keys: nightly-ok-
-      - id: decide
-        run: |
-          set -u
-          decide() { echo "run=$1" >> "$GITHUB_OUTPUT"; echo "reuse=$2" >> "$GITHUB_OUTPUT"; echo "::notice::$3"; exit 0; }
-          [ "${{ github.event_name }}" = schedule ] || decide true true "run by hand"
-          [ "${{ steps.tested.outputs.cache-hit }}" = true ] && decide false false "${GITHUB_SHA::8} already passed a nightly run"
-          last=$(cat .nightly-ok/sha 2> /dev/null || true)
-          [ -n "$last" ] || decide true true "no earlier nightly pass to compare with"
-          git cat-file -e "$last^{commit}" 2> /dev/null || decide true true "last passed commit $last not in the history"
-          git diff --name-only "$last" HEAD > "$RUNNER_TEMP/files"
-          [ -s "$RUNNER_TEMP/files" ] || decide false false "no change since ${last::8} passed"
-          # what the firmware builds read (ci.yml's paths, less the tests and license files)
-          if grep -qE '^(Makefile|\.gitmodules|\.github/actions/|\.github/workflows/nightly\.yml$|(boards|boot|config|core|drivers|hal|platform|third_party|tools)/)' \
-            "$RUNNER_TEMP/files"; then
-            decide true true "firmware inputs changed since ${last::8} passed"
-          fi
-          { echo "run=false"; echo "reuse=true"; echo "mark=true"; } >> "$GITHUB_OUTPUT"
-          echo "::notice::no firmware input changed since ${last::8} passed: matrix skipped, this commit counts as passed"
-      # nothing the builds read changed, so this commit's matrix would be the last pass's: record it as passed here,
-      # without the mark job, so later nights diff against it
-      - name: Remember that this commit passed
-        if: steps.decide.outputs.mark == 'true'
-        run: mkdir -p .nightly-ok && echo "$GITHUB_SHA" > .nightly-ok/sha
-      - if: steps.decide.outputs.mark == 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
-        with:
-          path: .nightly-ok
-          key: nightly-ok-${{ github.sha }}
+env:
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  BOARD_SELECTION: ${{ inputs.boards }}
+  WORKFLOW_SHA: ${{ github.workflow_sha }}
+  WORKFLOW_REF: ${{ github.workflow_ref }}
 
-  matrix:
-    # one job per toolchain: every board built with it in turn (tools/ci.sh --toolchain, from the registry), so the
-    # checkout, submodules and compiler are set up once per toolchain, not once per radio
-    name: matrix (${{ matrix.name }})
-    needs: changes
-    if: (github.server_url != 'https://github.com' || vars.RFOUNDRY_CI_GITHUB == 'true') && (needs.changes.outputs.run == 'true')
+jobs:
+  discover:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.registry.outputs.matrix }}
+    steps:
+      - name: Record the request before checkout
+        run: |
+          mkdir -p "$RUNNER_TEMP/p25-source-proof"
+          printf '%s\n' "source=$SOURCE_SHA" "workflow=$WORKFLOW_SHA" "workflow_ref=$WORKFLOW_REF" \
+            "boards=$BOARD_SELECTION" > "$RUNNER_TEMP/p25-source-proof/request.txt"
+      - name: Check out the exact product source
+        id: source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: false
+      - name: Prove the source and discover the board matrix
+        id: registry
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee "$RUNNER_TEMP/p25-source-proof/head.txt"
+          git status --porcelain --untracked-files=all > "$RUNNER_TEMP/p25-source-proof/status.txt"
+          test "$(cat "$RUNNER_TEMP/p25-source-proof/head.txt")" = "$SOURCE_SHA"
+          test "$(git rev-parse --is-shallow-repository)" = false
+          test ! -s "$RUNNER_TEMP/p25-source-proof/status.txt"
+          PY=$(tools/rfoundry_python.sh)
+          "$PY" tools/boards.py json --for build --out "$RUNNER_TEMP/p25-source-proof/registry-build.json"
+          "$PY" - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          proof = Path(os.environ["RUNNER_TEMP"]) / "p25-source-proof"
+          registry = json.loads((proof / "registry-build.json").read_text())
+          boards = registry["boards"]
+          selection = os.environ["BOARD_SELECTION"].strip()
+          if selection == "all":
+              selected = sorted(boards)
+          else:
+              selected = [item.strip() for item in selection.split(",")]
+              if not all(selected) or len(set(selected)) != len(selected):
+                  raise SystemExit("boards must be all or distinct, nonempty comma-separated registry IDs")
+              unknown = sorted(set(selected) - set(boards))
+              if unknown:
+                  raise SystemExit("unknown boards: %s; registry IDs: %s" % (", ".join(unknown), ", ".join(sorted(boards))))
+              selected = sorted(selected)
+          if not selected:
+              raise SystemExit("the source registry selected no boards")
+          include = []
+          for board in selected:
+              platform = boards[board]["platform"]
+              toolchain = registry["platforms"][platform]["toolchain"]
+              if not all(re.fullmatch(r"[a-z0-9][a-z0-9_-]*", value) for value in (board, toolchain)):
+                  raise SystemExit("invalid board/toolchain ID in the source registry")
+              include.append({"board": board, "toolchain": toolchain})
+          git = lambda *args: subprocess.check_output(["git", *args], text=True).strip()
+          record = {"requested_source": os.environ["SOURCE_SHA"], "head": git("rev-parse", "HEAD"),
+                    "tree": git("rev-parse", "HEAD^{tree}"), "commit_time": git("show", "-s", "--format=%ct", "HEAD"),
+                    "status": git("status", "--porcelain", "--untracked-files=all"),
+                    "shallow": git("rev-parse", "--is-shallow-repository"),
+                    "workflow_sha": os.environ["WORKFLOW_SHA"], "workflow_ref": os.environ["WORKFLOW_REF"],
+                    "requested_boards": selection, "matrix": include}
+          (proof / "source.json").write_text(json.dumps(record, indent=2) + "\n")
+          matrix = json.dumps({"include": include}, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("matrix=" + matrix + "\n")
+          print(matrix)
+          PY
+      - name: Upload registry and source proof
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        with:
+          name: registry-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/p25-source-proof/
+          if-no-files-found: error
+
+  firmware:
+    name: firmware (${{ matrix.board }}, ${{ matrix.toolchain }})
+    needs: discover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        # the [toolchain] ids of platform/*/platform.toml, with their names; a new platform on a toolchain listed here
-        # needs no edit, a new toolchain gets an entry here and its set-up in .github/actions/toolchain
-        include:
-          - { toolchain: arm, name: Arm }
-          - { toolchain: csky, name: C-SKY }
-    permissions:
-      contents: read
-      packages: read   # pulling a private ghcr.io csky-elf image with the job token
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      BOARD: ${{ matrix.board }}
+      TOOLCHAIN: ${{ matrix.toolchain }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+      - name: Record the request before checkout
+        run: |
+          mkdir -p "$RUNNER_TEMP/p25-source-proof"
+          printf '%s\n' "source=$SOURCE_SHA" "workflow=$WORKFLOW_SHA" "workflow_ref=$WORKFLOW_REF" \
+            "board=$BOARD" "toolchain=$TOOLCHAIN" > "$RUNNER_TEMP/p25-source-proof/request.txt"
+      - name: Check out the exact product source
+        id: source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
         with:
-          submodules: false   # tools/checkout-submodules.sh: the runner image's copies, then the network
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: false
+      - name: Prove the source and matrix selection
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee "$RUNNER_TEMP/p25-source-proof/head.txt"
+          git status --porcelain --untracked-files=all > "$RUNNER_TEMP/p25-source-proof/status.txt"
+          test "$(cat "$RUNNER_TEMP/p25-source-proof/head.txt")" = "$SOURCE_SHA"
+          test "$(git rev-parse --is-shallow-repository)" = false
+          test ! -s "$RUNNER_TEMP/p25-source-proof/status.txt"
+          PY=$(tools/rfoundry_python.sh)
+          "$PY" tools/boards.py json --for build --out "$RUNNER_TEMP/p25-source-proof/registry-build.json"
+          "$PY" - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          proof = Path(os.environ["RUNNER_TEMP"]) / "p25-source-proof"
+          registry = json.loads((proof / "registry-build.json").read_text())
+          board = registry["boards"][os.environ["BOARD"]]
+          platform = board["platform"]
+          assert registry["platforms"][platform]["toolchain"] == os.environ["TOOLCHAIN"]
+          git = lambda *args: subprocess.check_output(["git", *args], text=True).strip()
+          record = {"requested_source": os.environ["SOURCE_SHA"], "head": git("rev-parse", "HEAD"),
+                    "tree": git("rev-parse", "HEAD^{tree}"), "commit_time": git("show", "-s", "--format=%ct", "HEAD"),
+                    "status": git("status", "--porcelain", "--untracked-files=all"),
+                    "shallow": git("rev-parse", "--is-shallow-repository"),
+                    "workflow_sha": os.environ["WORKFLOW_SHA"], "workflow_ref": os.environ["WORKFLOW_REF"],
+                    "board": os.environ["BOARD"], "platform": platform, "toolchain": os.environ["TOOLCHAIN"]}
+          (proof / "source.json").write_text(json.dumps(record, indent=2) + "\n")
+          PY
       - name: third_party submodules
-        run: tools/checkout-submodules.sh
-      - name: Toolchain (platform.toml [toolchain])
+        run: |
+          set -euo pipefail
+          tools/checkout-submodules.sh 2>&1 | tee "$RUNNER_TEMP/p25-source-proof/submodules.log"
+          git submodule status --recursive > "$RUNNER_TEMP/p25-source-proof/submodule-pins.txt"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Toolchain (source platform.toml pin)
         id: tc
         uses: ./.github/actions/toolchain
         with:
           toolchain: ${{ matrix.toolchain }}
           image: ${{ vars.RFOUNDRY_CSKY_IMAGE }}
-          registry: ${{ vars.RFOUNDRY_CSKY_REGISTRY }}
-          # a read-only registry token (secret); on GitHub a ghcr.io package linked to this repository takes the job's
-          # own token (packages: read)
-          registry-user: ${{ vars.RFOUNDRY_CSKY_REGISTRY_USER || github.actor }}
-          registry-token: ${{ secrets.RFOUNDRY_CSKY_REGISTRY_TOKEN || github.token }}
-      - name: Feature matrix of every board on the toolchain
+      - name: Full official firmware gate for this board
         env:
-          RUN: ${{ steps.tc.outputs.run }}   # empty, or the csky-elf image's run.sh
-          TOOLCHAIN: ${{ matrix.toolchain }}
+          RUN: ${{ steps.tc.outputs.run }}
         run: |
-          set -u
-          rc=0
-          $RUN tools/ci.sh --matrix --steps firmware --toolchain "$TOOLCHAIN" || rc=$?
+          set -euo pipefail
+          source_run() {
+            if [ -n "$RUN" ]; then "$RUN" env GITHUB_SHA="$SOURCE_SHA" "$@"
+            else env GITHUB_SHA="$SOURCE_SHA" "$@"; fi
+          }
+          # The Makefile takes identity/time from git HEAD. Also keep child process metadata on the product SHA.
+          source_run make -s BOARD="$BOARD" print-vars \
+            VARS='RFOUNDRY_VERSION RFOUNDRY_GIT_HEAD RFOUNDRY_GIT_DIRTY RFOUNDRY_GIT_TIME' \
+            2>&1 | tee "$RUNNER_TEMP/p25-source-proof/build-metadata.log"
+          grep -Fx "RFOUNDRY_VERSION=${SOURCE_SHA:0:8}" "$RUNNER_TEMP/p25-source-proof/build-metadata.log"
+          grep -Fx 'RFOUNDRY_GIT_DIRTY=0' "$RUNNER_TEMP/p25-source-proof/build-metadata.log"
+          set +e
+          source_run tools/ci.sh --board "$BOARD" --steps firmware \
+            2>&1 | tee "$RUNNER_TEMP/p25-source-proof/full-firmware.log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          rc=${statuses[0]}
+          if [ "${statuses[1]}" != 0 ]; then exit "${statuses[1]}"; fi
           if [ "$rc" = 3 ]; then
-            echo "::notice::$TOOLCHAIN matrix skipped: the image ${RFOUNDRY_CSKY_IMAGE:-} isn't available on this runner (docs/dev/ci.md)"
-            exit 0
+            echo '::error::the required toolchain/image is unavailable; a skipped firmware gate is a failure'
+            exit 1
           fi
-          [ -f build/ci/size-report.md ] && cat build/ci/size-report.md >> "$GITHUB_STEP_SUMMARY"
-          exit "$rc"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
-        if: always()
-        with:
-          name: matrix-${{ matrix.toolchain }}
-          path: |
-            build/ci/size-report.md
-            build/ci/*.log
-          if-no-files-found: ignore
-
-  reuse:
-    needs: changes
-    if: (github.server_url != 'https://github.com' || vars.RFOUNDRY_CI_GITHUB == 'true') && (needs.changes.outputs.reuse == 'true')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
-        with:
-          submodules: false
-      - name: reuse lint (a warning until the tree passes)
+          if [ "$rc" != 0 ]; then exit "$rc"; fi
+          PY=$(tools/rfoundry_python.sh)
+          "$PY" - <<'PY'
+          import os, re
+          from pathlib import Path
+          proof = Path(os.environ["RUNNER_TEMP"]) / "p25-source-proof"
+          log = (proof / "full-firmware.log").read_text()
+          if re.search(r"^ci: (?:FAIL|warn)\b|^ci: skip .*compiler .*not installed|^ci: skip .*no board built", log, re.M):
+              raise SystemExit("official gate warned, failed, or skipped a required compiler/build")
+          if "ci: all checks passed" not in log.splitlines():
+              raise SystemExit("official firmware gate did not finish")
+          rows = []
+          for line in Path("build/ci/size-report.md").read_text().splitlines():
+              cells = [cell.strip() for cell in line.split("|")]
+              if len(cells) > 3 and cells[1] == os.environ["BOARD"] and cells[3].isdigit():
+                  rows.append(cells[2])
+          if not {"default", "maximal", "fm-minimal"} <= set(rows):
+              raise SystemExit("the board's complete default/maximal/fm-minimal rows are missing")
+          PY
+          cat build/ci/size-report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Record and verify final source state
+        if: always() && steps.source.outcome == 'success'
         run: |
-          set -u
-          if [ -x /opt/reuse/bin/reuse ]; then PATH="/opt/reuse/bin:$PATH"   # the self-hosted runner's image
-          else pipx install reuse > /dev/null && PATH="$HOME/.local/bin:$PATH"; fi
-          if ! reuse lint; then
-            echo "::warning::reuse lint does not pass yet (see the log; docs/dev/ci.md)"
-          fi
-
-  mark:
-    needs: [matrix]
-    if: (github.server_url != 'https://github.com' || vars.RFOUNDRY_CI_GITHUB == 'true')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Remember that this commit passed
-        run: mkdir -p .nightly-ok && echo "$GITHUB_SHA" > .nightly-ok/sha   # the next run diffs against it
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9   # v6.1.0
+          set -euo pipefail
+          git rev-parse HEAD > "$RUNNER_TEMP/p25-source-proof/final-head.txt"
+          git status --porcelain --untracked-files=all > "$RUNNER_TEMP/p25-source-proof/final-status.txt"
+          test "$(cat "$RUNNER_TEMP/p25-source-proof/final-head.txt")" = "$SOURCE_SHA"
+          test ! -s "$RUNNER_TEMP/p25-source-proof/final-status.txt"
+      - name: Upload every log, size report and source proof
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
         with:
-          path: .nightly-ok
-          key: nightly-ok-${{ github.sha }}
+          name: firmware-${{ inputs.source_sha }}-${{ matrix.board }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/p25-source-proof/
+            build/ci/*.log
+            build/ci/**/*.log
+            build/ci/size-report.md
+          if-no-files-found: error
